@@ -1,13 +1,13 @@
-# 📁 orecchiette-sdr-file-rs: File-backed SDR Sources
+# orecchiette-sdr-file-rs
 
 [![CI](https://github.com/isaacbentley/orecchiette-sdr-file-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette-sdr-file-rs/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/rustc-1.85+-ab6000.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+[![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/orecchiette-sdr-file-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
-## 🎯 **Overview**
+File-backed implementations of the [`SdrSource`](https://github.com/isaacbentley/orecchiette-sdr-source-rs) trait: raw interleaved IQ and SigMF (Signal Metadata Format) recordings.
 
-File-backed implementations of the
-[`SdrSource`](https://github.com/isaacbentley/orecchiette-sdr-source-rs) trait. Two source types
-share the crate:
+## Overview
+
+Two source types share the crate:
 
 | Source | Inputs | Centre frequency comes from |
 |---|---|---|
@@ -19,11 +19,21 @@ back at its natural rate. They accept `DwellAdvice` at the trait
 boundary and ignore it.
 
 Each backend streams the data in 1 MB I/O chunks, decodes into
-`Complex32`, and emits 262 144-sample `IqPacket`s to match the
-SDR applications worker pool's batch expectation. Partial samples at chunk
+`Complex32`, and emits 262 144-sample `IqPacket`s to match a
+typical worker pool's batch expectation. Partial samples at chunk
 boundaries are stitched across reads so no IQ pair is split.
 
-## 📄 **RawIqFileSource**
+## Installation
+
+Add the following to your `Cargo.toml`:
+
+```toml
+[dependencies]
+orecchiette-sdr-file-rs = "0.1.0"
+orecchiette-sdr-source-rs = "0.1.0"
+```
+
+## RawIqFileSource
 
 ```rust,ignore
 use orecchiette_sdr_file_rs::RawIqFileSource;
@@ -57,7 +67,7 @@ If you pass multiple paths, they're played sequentially.
 `config.sample_rate_hz` is the assumed playback rate; the caller is
 responsible for setting it to match how the file was recorded.
 
-## 📑 **SigmfFileSource**
+## SigmfFileSource
 
 ```rust,ignore
 use orecchiette_sdr_file_rs::SigmfFileSource;
@@ -91,11 +101,12 @@ For each path, the source:
 The caller's `config.sample_rate_hz` and any per-packet centre-frequency
 guess are ignored — SigMF metadata is the source of truth.
 
-## 🧪 **Tests**
+## MSRV & Semver Policy
 
-```bash
-cargo test -p orecchiette-sdr-file-rs
-```
+- **MSRV:** This crate does not maintain an explicit Minimum Supported Rust Version (MSRV) policy and tracks the latest `stable` compiler.
+- **Semver:** This crate follows semantic versioning. While in `0.x.y`, breaking API changes will result in a minor version bump (e.g. `0.1.x` to `0.2.0`).
+
+## Testing & Contributing
 
 14 tests cover:
 
@@ -111,29 +122,12 @@ cargo test -p orecchiette-sdr-file-rs
   three packets, verifying centre frequency and sample rate
   propagate from metadata.
 
-## 📦 **Dependencies**
+Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on running the test suite and formatting your code before submitting a Pull Request.
 
-```toml
-orecchiette-sdr-source-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-source-rs.git", branch = "main" }
-crossbeam     = "0.8"
-num-complex   = "0.4"
-anyhow        = "1.0"
-tracing       = "0.1"
-serde         = { version = "1.0", features = ["derive"] }
-serde_json    = "1.0"
-
-[dev-dependencies]
-tempfile      = "3"
-```
-
-## 📚 **Documentation**
+## Documentation
 
 - [Architecture & Design](DESIGN.md) — internal architecture and execution flow.
 
-## 📄 **License**
+## License
 
-This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later) - see the [LICENSE](../../LICENSE) file for details.
-
-## 📞 **Support**
-
-- 🐛 **Issues**: [GitHub Issues](https://github.com/isaacbentley/orecchiette-sdr-file-rs/issues)
+This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later) - see the [LICENSE](LICENSE) file for details.
