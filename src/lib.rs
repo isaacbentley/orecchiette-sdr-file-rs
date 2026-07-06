@@ -20,7 +20,9 @@ pub mod sigmf;
 
 use crossbeam::channel;
 use num_complex::Complex32;
-use sdr_source_rs::{DwellAdvice, IqPacket, SdrError, SdrHandle, SdrSource, SourceConfig};
+use orecchiette_sdr_source_rs::{
+    DwellAdvice, IqPacket, SdrError, SdrHandle, SdrSource, SourceConfig,
+};
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
@@ -77,7 +79,10 @@ impl SdrSource for RawIqFileSource {
                     let mut file = match File::open(&path) {
                         Ok(f) => f,
                         Err(e) => {
-                            warn!("sdr-file: failed to open {}: {e}", path.display());
+                            warn!(
+                                "orecchiette-sdr-file: failed to open {}: {e}",
+                                path.display()
+                            );
                             continue;
                         }
                     };
@@ -106,7 +111,7 @@ impl SdrSource for RawIqFileSource {
                             // < ~17 ms of every file at 15.36 MSPS.
                             if pending > 0 {
                                 warn!(
-                                    "sdr-file: {} ends in {} byte(s) of a truncated sample; discarded",
+                                    "orecchiette-sdr-file: {} ends in {} byte(s) of a truncated sample; discarded",
                                     path.display(),
                                     pending
                                 );
@@ -119,7 +124,7 @@ impl SdrSource for RawIqFileSource {
                                 pooled.extend_from_slice(&leftovers);
                                 leftovers.clear();
                                 let pkt = IqPacket {
-                                    samples: sdr_source_rs::PooledIqBuffer::new_pooled(
+                                    samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
                                         pooled,
                                         pool_tx.clone(),
                                     ),
@@ -157,7 +162,7 @@ impl SdrSource for RawIqFileSource {
                             pooled.clear();
                             pooled.extend_from_slice(chunk);
                             let pkt = IqPacket {
-                                samples: sdr_source_rs::PooledIqBuffer::new_pooled(
+                                samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
                                     pooled,
                                     pool_tx.clone(),
                                 ),
@@ -308,7 +313,7 @@ impl SdrSource for SigmfFileSource {
                                 pooled.extend_from_slice(&leftovers);
                                 leftovers.clear();
                                 let pkt = IqPacket {
-                                    samples: sdr_source_rs::PooledIqBuffer::new_pooled(
+                                    samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
                                         pooled,
                                         pool_tx.clone(),
                                     ),
@@ -348,7 +353,7 @@ impl SdrSource for SigmfFileSource {
                             pooled.clear();
                             pooled.extend_from_slice(chunk);
                             let pkt = IqPacket {
-                                samples: sdr_source_rs::PooledIqBuffer::new_pooled(
+                                samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
                                     pooled,
                                     pool_tx.clone(),
                                 ),

@@ -1,12 +1,12 @@
-# 📁 sdr-file-rs: File-backed SDR Sources
+# 📁 orecchiette-sdr-file-rs: File-backed SDR Sources
 
-[![CI](https://github.com/isaacbentley/sdr-file-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/sdr-file-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/isaacbentley/orecchiette-sdr-file-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette-sdr-file-rs/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/rustc-1.85+-ab6000.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 ## 🎯 **Overview**
 
 File-backed implementations of the
-[`SdrSource`](https://github.com/isaacbentley/sdr-source-rs) trait. Two source types
+[`SdrSource`](https://github.com/isaacbentley/orecchiette-sdr-source-rs) trait. Two source types
 share the crate:
 
 | Source | Inputs | Centre frequency comes from |
@@ -26,8 +26,8 @@ boundaries are stitched across reads so no IQ pair is split.
 ## 📄 **RawIqFileSource**
 
 ```rust,ignore
-use sdr_file_rs::RawIqFileSource;
-use sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
+use orecchiette_sdr_file_rs::RawIqFileSource;
+use orecchiette_sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -60,8 +60,8 @@ responsible for setting it to match how the file was recorded.
 ## 📑 **SigmfFileSource**
 
 ```rust,ignore
-use sdr_file_rs::SigmfFileSource;
-use sdr_source_rs::{SdrSource, SourceConfig};
+use orecchiette_sdr_file_rs::SigmfFileSource;
+use orecchiette_sdr_source_rs::{SdrSource, SourceConfig};
 use std::path::PathBuf;
 // `advice` constructed as in the RawIqFileSource example above.
 
@@ -94,7 +94,7 @@ guess are ignored — SigMF metadata is the source of truth.
 ## 🧪 **Tests**
 
 ```bash
-cargo test -p sdr-file-rs
+cargo test -p orecchiette-sdr-file-rs
 ```
 
 14 tests cover:
@@ -114,7 +114,7 @@ cargo test -p sdr-file-rs
 ## 📦 **Dependencies**
 
 ```toml
-sdr-source-rs = { git = "https://github.com/isaacbentley/sdr-source-rs.git", branch = "main" }
+orecchiette-sdr-source-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-source-rs.git", branch = "main" }
 crossbeam     = "0.8"
 num-complex   = "0.4"
 anyhow        = "1.0"
@@ -136,4 +136,4 @@ This project is licensed under the GNU General Public License v3.0 or later (GPL
 
 ## 📞 **Support**
 
-- 🐛 **Issues**: [GitHub Issues](https://github.com/isaacbentley/sdr-file-rs/issues)
+- 🐛 **Issues**: [GitHub Issues](https://github.com/isaacbentley/orecchiette-sdr-file-rs/issues)

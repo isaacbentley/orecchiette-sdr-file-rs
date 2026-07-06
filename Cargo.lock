@@ -223,6 +223,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "orecchiette-sdr-file-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam",
+ "num-complex",
+ "orecchiette-sdr-source-rs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "orecchiette-sdr-source-rs"
+version = "0.1.0"
+source = "git+https://github.com/isaacbentley/orecchiette-sdr-source-rs.git?branch=main#60bf65d37b3332014261dff99f905f6b2eb6352d"
+dependencies = [
+ "anyhow",
+ "crossbeam",
+ "num-complex",
+ "thiserror",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,31 +298,6 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys",
-]
-
-[[package]]
-name = "sdr-file-rs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossbeam",
- "num-complex",
- "sdr-source-rs",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "sdr-source-rs"
-version = "0.1.0"
-source = "git+https://github.com/isaacbentley/sdr-source-rs.git?branch=main#3101352d0ce1271a23365db0a15081693b1a52c2"
-dependencies = [
- "anyhow",
- "crossbeam",
- "num-complex",
- "thiserror",
 ]
 
 [[package]]

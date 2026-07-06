@@ -1,6 +1,6 @@
-# Design: File-backed SDR Sources (sdr-file-rs)
+# Design: File-backed SDR Sources (orecchiette-sdr-file-rs)
 
-This document outlines the design of the `sdr-file-rs` crate, which provides file-backed offline playback for the SDR detection applications detection system.
+This document outlines the design of the `orecchiette-sdr-file-rs` crate, which provides file-backed offline playback for the SDR detection applications detection system.
 
 ## 1. Introduction
 
