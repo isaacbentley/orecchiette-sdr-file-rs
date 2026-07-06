@@ -1,6 +1,6 @@
 name: CI
 
-# Six-job pipeline for the standalone aaronia-rs crate. Designed to
+# Six-job pipeline for the standalone orecchiette-sdr-file-rs crate. Designed to
 # move cleanly when the crate is extracted from the orecchiette
 # monorepo: this workflow stays alongside `Cargo.toml`, so a
 # `git subtree split` or directory copy carries it intact.
