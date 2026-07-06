@@ -3,12 +3,14 @@ name = "orecchiette-sdr-file-rs"
 license = "GPL-3.0-or-later"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-
 description = "File-backed SdrSource implementations: raw interleaved IQ and SigMF (Signal Metadata Format) recordings."
+repository = "https://github.com/isaacbentley/orecchiette-sdr-file-rs"
+readme = "README.md"
+keywords = ["sdr", "sigmf", "iq", "rf"]
+categories = ["hardware-support", "api-bindings"]
 
 [dependencies]
-orecchiette-sdr-source-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-source-rs.git", branch = "main" }
+orecchiette-sdr-source-rs = "0.1.0"
 crossbeam = "0.8"
 num-complex = "0.4"
 anyhow = "1.0"

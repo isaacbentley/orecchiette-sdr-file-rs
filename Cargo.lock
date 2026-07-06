@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "autocfg"
@@ -239,7 +239,8 @@ dependencies = [
 [[package]]
 name = "orecchiette-sdr-source-rs"
 version = "0.1.0"
-source = "git+https://github.com/isaacbentley/orecchiette-sdr-source-rs.git?branch=main#60bf65d37b3332014261dff99f905f6b2eb6352d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05fd12509fa0f71cbee933ee32e8ea4b5ab9b5ddd3fe97618f5979c8624e93ba"
 dependencies = [
  "anyhow",
  "crossbeam",
