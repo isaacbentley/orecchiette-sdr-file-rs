@@ -57,6 +57,9 @@ impl SdrSource for RawIqFileSource {
                 "RawIqFileSource: no paths to play".into(),
             ));
         }
+        if config.sample_rate_hz <= 0.0 {
+            return Err(SdrError::BadConfig("RawIqFileSource: sample_rate_hz must be > 0".into()));
+        }
         let (tx, receiver) = channel::bounded::<IqPacket>(1024);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_for_thread = stop_flag.clone();
@@ -64,65 +67,104 @@ impl SdrSource for RawIqFileSource {
         let center = self.center_frequency_hz;
         let rate = config.sample_rate_hz as f32;
 
-        let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(256);
-        for _ in 0..256 {
+        let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(1024);
+        for _ in 0..1024 {
             let _ = pool_tx.send(Vec::with_capacity(PACKET_SAMPLES));
         }
 
         let capture_thread = thread::spawn(move || {
-            if let Err(e) = (move || -> Result<(), anyhow::Error> {
-                for path in paths {
-                    if stop_for_thread.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let is_bin = path.extension().is_some_and(|e| e == "bin");
-                    let mut file = match File::open(&path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            warn!(
-                                "orecchiette-sdr-file: failed to open {}: {e}",
-                                path.display()
-                            );
-                            continue;
-                        }
-                    };
-                    let mut buffer = vec![0u8; IO_BUFFER_BYTES];
-                    let mut leftovers: Vec<Complex32> = Vec::new();
-
-                    // Bytes 0..pending hold a partial sample carried over
-                    // from the previous read. Carrying in the buffer (rather
-                    // than seeking back) keeps IQ alignment across short
-                    // reads without re-reading: a seek-back of a tail
-                    // shorter than one sample re-reads the same bytes
-                    // forever on truncated files.
-                    let mut pending = 0usize;
-                    loop {
+            let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                if let Err(e) = (move || -> Result<(), anyhow::Error> {
+                    for path in paths {
                         if stop_for_thread.load(Ordering::SeqCst) {
-                            return Ok(());
+                            break;
                         }
-                        let n = file.read(&mut buffer[pending..])?;
-                        if n == 0 {
-                            // EOF: flush any partial-sample tail before moving
-                            // on to the next file. Tail packets are smaller
-                            // than `PACKET_SAMPLES`; the downstream DSP gates
-                            // on a minimum buffer size, so a very short tail
-                            // simply doesn't trigger a detection. Dropping it
-                            // silently (the pre-fix behaviour) lost the last
-                            // < ~17 ms of every file at 15.36 MSPS.
-                            if pending > 0 {
+                        let is_bin = path.extension().is_some_and(|e| e == "bin");
+                        let mut file = match File::open(&path) {
+                            Ok(f) => f,
+                            Err(e) => {
                                 warn!(
-                                    "orecchiette-sdr-file: {} ends in {} byte(s) of a truncated sample; discarded",
-                                    path.display(),
-                                    pending
+                                    "orecchiette-sdr-file: failed to open {}: {e}",
+                                    path.display()
                                 );
+                                continue;
                             }
-                            if !leftovers.is_empty() {
+                        };
+                        let mut buffer = vec![0u8; IO_BUFFER_BYTES];
+                        let mut leftovers: Vec<Complex32> = Vec::new();
+
+                        // Bytes 0..pending hold a partial sample carried over
+                        // from the previous read. Carrying in the buffer (rather
+                        // than seeking back) keeps IQ alignment across short
+                        // reads without re-reading: a seek-back of a tail
+                        // shorter than one sample re-reads the same bytes
+                        // forever on truncated files.
+                        let mut pending = 0usize;
+                        loop {
+                            if stop_for_thread.load(Ordering::SeqCst) {
+                                return Ok(());
+                            }
+                            let n = file.read(&mut buffer[pending..])?;
+                            if n == 0 {
+                                // EOF: flush any partial-sample tail before moving
+                                // on to the next file. Tail packets are smaller
+                                // than `PACKET_SAMPLES`; the downstream DSP gates
+                                // on a minimum buffer size, so a very short tail
+                                // simply doesn't trigger a detection. Dropping it
+                                // silently (the pre-fix behaviour) lost the last
+                                // < ~17 ms of every file at 15.36 MSPS.
+                                if pending > 0 {
+                                    warn!(
+                                        "orecchiette-sdr-file: {} ends in {} byte(s) of a truncated sample; discarded",
+                                        path.display(),
+                                        pending
+                                    );
+                                }
+                                if !leftovers.is_empty() {
+                                    let mut pooled = pool_rx
+                                        .try_recv()
+                                        .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
+                                    pooled.clear();
+                                    pooled.extend_from_slice(&leftovers);
+                                    leftovers.clear();
+                                    let pkt = IqPacket {
+                                        samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
+                                            pooled,
+                                            pool_tx.clone(),
+                                        ),
+                                        center_frequency_hz: center,
+                                        sample_rate_hz: rate,
+                                        overrun: false,
+                                    };
+                                    if tx.send(pkt).is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                break;
+                            }
+                            let bps = if is_bin { 4 } else { 8 };
+                            let avail = pending + n;
+                            let full_bytes = avail - (avail % bps);
+                            let mut samples = decode_block(&buffer[..full_bytes], is_bin);
+                            // Carry the partial-sample tail to the front for the
+                            // next read.
+                            buffer.copy_within(full_bytes..avail, 0);
+                            pending = avail - full_bytes;
+
+                            let mut joined = Vec::with_capacity(leftovers.len() + samples.len());
+                            joined.append(&mut leftovers);
+                            joined.append(&mut samples);
+
+                            for chunk in joined.chunks(PACKET_SAMPLES) {
+                                if chunk.len() < PACKET_SAMPLES {
+                                    leftovers.extend_from_slice(chunk);
+                                    break;
+                                }
                                 let mut pooled = pool_rx
                                     .try_recv()
                                     .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
                                 pooled.clear();
-                                pooled.extend_from_slice(&leftovers);
-                                leftovers.clear();
+                                pooled.extend_from_slice(chunk);
                                 let pkt = IqPacket {
                                     samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
                                         pooled,
@@ -133,52 +175,18 @@ impl SdrSource for RawIqFileSource {
                                     overrun: false,
                                 };
                                 if tx.send(pkt).is_err() {
-                                    return Ok(());
+                                    return Ok(()); // consumer dropped
                                 }
-                            }
-                            break;
-                        }
-                        let bps = if is_bin { 4 } else { 8 };
-                        let avail = pending + n;
-                        let full_bytes = avail - (avail % bps);
-                        let mut samples = decode_block(&buffer[..full_bytes], is_bin);
-                        // Carry the partial-sample tail to the front for the
-                        // next read.
-                        buffer.copy_within(full_bytes..avail, 0);
-                        pending = avail - full_bytes;
-
-                        let mut joined = Vec::with_capacity(leftovers.len() + samples.len());
-                        joined.append(&mut leftovers);
-                        joined.append(&mut samples);
-
-                        for chunk in joined.chunks(PACKET_SAMPLES) {
-                            if chunk.len() < PACKET_SAMPLES {
-                                leftovers.extend_from_slice(chunk);
-                                break;
-                            }
-                            let mut pooled = pool_rx
-                                .try_recv()
-                                .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
-                            pooled.clear();
-                            pooled.extend_from_slice(chunk);
-                            let pkt = IqPacket {
-                                samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
-                                    pooled,
-                                    pool_tx.clone(),
-                                ),
-                                center_frequency_hz: center,
-                                sample_rate_hz: rate,
-                                overrun: false,
-                            };
-                            if tx.send(pkt).is_err() {
-                                return Ok(()); // consumer dropped
                             }
                         }
                     }
+                    Ok(())
+                })() {
+                    tracing::error!("[file] Capture thread failed: {:?}", e);
                 }
-                Ok(())
-            })() {
-                tracing::error!("[file] Capture thread failed: {:?}", e);
+            }));
+            if let Err(e) = panic_res {
+                tracing::error!("[file] Capture thread panicked: {:?}", e);
             }
         });
 
@@ -228,90 +236,135 @@ impl SdrSource for SigmfFileSource {
         let stop_for_thread = stop_flag.clone();
         let paths = self.paths.clone();
 
-        let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(256);
-        for _ in 0..256 {
+        let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(1024);
+        for _ in 0..1024 {
             let _ = pool_tx.send(Vec::with_capacity(PACKET_SAMPLES));
         }
 
         let capture_thread = thread::spawn(move || {
-            if let Err(e) = (move || -> Result<(), anyhow::Error> {
-                for path in paths {
-                    if stop_for_thread.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let (meta_path, data_path) = match sigmf::resolve_pair(&path) {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            warn!("sigmf: could not resolve {}: {e}", path.display());
-                            continue;
-                        }
-                    };
-                    let meta = match SigmfMetadata::load(&meta_path) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            warn!("sigmf: bad metadata {}: {e}", meta_path.display());
-                            continue;
-                        }
-                    };
-                    let datatype = match meta.data_type() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            warn!("sigmf: {}: {e}", meta_path.display());
-                            continue;
-                        }
-                    };
-                    let center_hz = meta.center_frequency_hz().unwrap_or_else(|| {
-                        warn!(
-                            "sigmf: {} has no core:frequency in any capture; tagging packets with 0 Hz",
-                            meta_path.display()
-                        );
-                        0.0
-                    });
-                    let sample_rate = meta.sample_rate_hz();
-                    let sample_rate_f32 = sample_rate as f32;
-                    info!(
-                        "sigmf: playing {} ({}, {} MHz @ {:.3} MSPS)",
-                        data_path.display(),
-                        meta.global.datatype,
-                        center_hz / 1e6,
-                        sample_rate / 1e6,
-                    );
-
-                    let mut file = match File::open(&data_path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            warn!("sigmf: failed to open {}: {e}", data_path.display());
-                            continue;
-                        }
-                    };
-                    let mut buffer = vec![0u8; IO_BUFFER_BYTES];
-                    let mut leftovers: Vec<Complex32> = Vec::new();
-
-                    // Partial-sample carry — see the matching note in
-                    // `RawIqFileSource::start`.
-                    let mut pending = 0usize;
-                    loop {
+            let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                if let Err(e) = (move || -> Result<(), anyhow::Error> {
+                    for path in paths {
                         if stop_for_thread.load(Ordering::SeqCst) {
-                            return Ok(());
+                            break;
                         }
-                        let n = file.read(&mut buffer[pending..])?;
-                        if n == 0 {
-                            // EOF: flush any partial-sample tail (see the
-                            // matching note in `RawIqFileSource::start`).
-                            if pending > 0 {
-                                warn!(
-                                    "sigmf: {} ends in {} byte(s) of a truncated sample; discarded",
-                                    data_path.display(),
-                                    pending
-                                );
+                        let (meta_path, data_path) = match sigmf::resolve_pair(&path) {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                warn!("sigmf: could not resolve {}: {e}", path.display());
+                                continue;
                             }
-                            if !leftovers.is_empty() {
+                        };
+                        let meta = match SigmfMetadata::load(&meta_path) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!("sigmf: bad metadata {}: {e}", meta_path.display());
+                                continue;
+                            }
+                        };
+                        let datatype = match meta.data_type() {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!("sigmf: {}: {e}", meta_path.display());
+                                continue;
+                            }
+                        };
+                        let center_hz = meta.center_frequency_hz().unwrap_or_else(|| {
+                            warn!(
+                                "sigmf: {} has no core:frequency in any capture; tagging packets with 0 Hz",
+                                meta_path.display()
+                            );
+                            0.0
+                        });
+                        let sample_rate = meta.sample_rate_hz();
+                        if sample_rate <= 0.0 {
+                            warn!("sigmf: invalid sample rate {} Hz in {}; skipping file", sample_rate, meta_path.display());
+                            continue;
+                        }
+                        let sample_rate_f32 = sample_rate as f32;
+                        info!(
+                            "sigmf: playing {} ({}, {} MHz @ {:.3} MSPS)",
+                            data_path.display(),
+                            meta.global.datatype,
+                            center_hz / 1e6,
+                            sample_rate / 1e6,
+                        );
+
+                        let mut file = match File::open(&data_path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                warn!("sigmf: failed to open {}: {e}", data_path.display());
+                                continue;
+                            }
+                        };
+                        let mut buffer = vec![0u8; IO_BUFFER_BYTES];
+                        let mut leftovers: Vec<Complex32> = Vec::new();
+
+                        // Partial-sample carry — see the matching note in
+                        // `RawIqFileSource::start`.
+                        let mut pending = 0usize;
+                        loop {
+                            if stop_for_thread.load(Ordering::SeqCst) {
+                                return Ok(());
+                            }
+                            let n = file.read(&mut buffer[pending..])?;
+                            if n == 0 {
+                                // EOF: flush any partial-sample tail (see the
+                                // matching note in `RawIqFileSource::start`).
+                                if pending > 0 {
+                                    warn!(
+                                        "sigmf: {} ends in {} byte(s) of a truncated sample; discarded",
+                                        data_path.display(),
+                                        pending
+                                    );
+                                }
+                                if !leftovers.is_empty() {
+                                    let mut pooled = pool_rx
+                                        .try_recv()
+                                        .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
+                                    pooled.clear();
+                                    pooled.extend_from_slice(&leftovers);
+                                    leftovers.clear();
+                                    let pkt = IqPacket {
+                                        samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
+                                            pooled,
+                                            pool_tx.clone(),
+                                        ),
+                                        center_frequency_hz: center_hz,
+                                        sample_rate_hz: sample_rate_f32,
+                                        overrun: false,
+                                    };
+                                    if tx.send(pkt).is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                break;
+                            }
+                            // Round down to a multiple of `bytes_per_sample` so
+                            // we never split an IQ pair across reads; the
+                            // trailing partial bytes are carried in the front of
+                            // the buffer for the next read.
+                            let bps = datatype.bytes_per_sample();
+                            let avail = pending + n;
+                            let full_bytes = avail - (avail % bps);
+                            let mut samples = datatype.decode(&buffer[..full_bytes]);
+                            buffer.copy_within(full_bytes..avail, 0);
+                            pending = avail - full_bytes;
+
+                            let mut joined = Vec::with_capacity(leftovers.len() + samples.len());
+                            joined.append(&mut leftovers);
+                            joined.append(&mut samples);
+
+                            for chunk in joined.chunks(PACKET_SAMPLES) {
+                                if chunk.len() < PACKET_SAMPLES {
+                                    leftovers.extend_from_slice(chunk);
+                                    break;
+                                }
                                 let mut pooled = pool_rx
                                     .try_recv()
                                     .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
                                 pooled.clear();
-                                pooled.extend_from_slice(&leftovers);
-                                leftovers.clear();
+                                pooled.extend_from_slice(chunk);
                                 let pkt = IqPacket {
                                     samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
                                         pooled,
@@ -325,51 +378,15 @@ impl SdrSource for SigmfFileSource {
                                     return Ok(());
                                 }
                             }
-                            break;
-                        }
-                        // Round down to a multiple of `bytes_per_sample` so
-                        // we never split an IQ pair across reads; the
-                        // trailing partial bytes are carried in the front of
-                        // the buffer for the next read.
-                        let bps = datatype.bytes_per_sample();
-                        let avail = pending + n;
-                        let full_bytes = avail - (avail % bps);
-                        let mut samples = datatype.decode(&buffer[..full_bytes]);
-                        buffer.copy_within(full_bytes..avail, 0);
-                        pending = avail - full_bytes;
-
-                        let mut joined = Vec::with_capacity(leftovers.len() + samples.len());
-                        joined.append(&mut leftovers);
-                        joined.append(&mut samples);
-
-                        for chunk in joined.chunks(PACKET_SAMPLES) {
-                            if chunk.len() < PACKET_SAMPLES {
-                                leftovers.extend_from_slice(chunk);
-                                break;
-                            }
-                            let mut pooled = pool_rx
-                                .try_recv()
-                                .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
-                            pooled.clear();
-                            pooled.extend_from_slice(chunk);
-                            let pkt = IqPacket {
-                                samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
-                                    pooled,
-                                    pool_tx.clone(),
-                                ),
-                                center_frequency_hz: center_hz,
-                                sample_rate_hz: sample_rate_f32,
-                                overrun: false,
-                            };
-                            if tx.send(pkt).is_err() {
-                                return Ok(());
-                            }
                         }
                     }
+                    Ok(())
+                })() {
+                    tracing::error!("[file] Capture thread failed: {:?}", e);
                 }
-                Ok(())
-            })() {
-                tracing::error!("[file] Capture thread failed: {:?}", e);
+            }));
+            if let Err(e) = panic_res {
+                tracing::error!("[file] Capture thread panicked: {:?}", e);
             }
         });
 
