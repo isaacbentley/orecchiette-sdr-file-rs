@@ -58,7 +58,9 @@ impl SdrSource for RawIqFileSource {
             ));
         }
         if config.sample_rate_hz <= 0.0 {
-            return Err(SdrError::BadConfig("RawIqFileSource: sample_rate_hz must be > 0".into()));
+            return Err(SdrError::BadConfig(
+                "RawIqFileSource: sample_rate_hz must be > 0".into(),
+            ));
         }
         let (tx, receiver) = channel::bounded::<IqPacket>(1024);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -128,10 +130,11 @@ impl SdrSource for RawIqFileSource {
                                     pooled.extend_from_slice(&leftovers);
                                     leftovers.clear();
                                     let pkt = IqPacket {
-                                        samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
-                                            pooled,
-                                            pool_tx.clone(),
-                                        ),
+                                        samples:
+                                            orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
+                                                pooled,
+                                                pool_tx.clone(),
+                                            ),
                                         center_frequency_hz: center,
                                         sample_rate_hz: rate,
                                         overrun: false,
@@ -278,7 +281,11 @@ impl SdrSource for SigmfFileSource {
                         });
                         let sample_rate = meta.sample_rate_hz();
                         if sample_rate <= 0.0 {
-                            warn!("sigmf: invalid sample rate {} Hz in {}; skipping file", sample_rate, meta_path.display());
+                            warn!(
+                                "sigmf: invalid sample rate {} Hz in {}; skipping file",
+                                sample_rate,
+                                meta_path.display()
+                            );
                             continue;
                         }
                         let sample_rate_f32 = sample_rate as f32;
@@ -326,10 +333,11 @@ impl SdrSource for SigmfFileSource {
                                     pooled.extend_from_slice(&leftovers);
                                     leftovers.clear();
                                     let pkt = IqPacket {
-                                        samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
-                                            pooled,
-                                            pool_tx.clone(),
-                                        ),
+                                        samples:
+                                            orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
+                                                pooled,
+                                                pool_tx.clone(),
+                                            ),
                                         center_frequency_hz: center_hz,
                                         sample_rate_hz: sample_rate_f32,
                                         overrun: false,
