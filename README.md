@@ -101,6 +101,41 @@ For each path, the source:
 The caller's `config.sample_rate_hz` and any per-packet centre-frequency
 guess are ignored — SigMF metadata is the source of truth.
 
+## SigmfWriter
+
+The crate also owns the write side of the format, so every SigMF-producing
+binary in this ecosystem shares one implementation instead of hand-rolling
+its own buffer sizing, byte encoding, and metadata JSON:
+
+```rust,ignore
+use orecchiette_sdr_file_rs::sigmf::{SigmfWriter, SigmfWriterMeta, SigmfCapture, DataType};
+
+let mut writer = SigmfWriter::create(Path::new("captures/drone"), DataType::Cf32Le)?;
+writer.write_samples(&samples)?; // or write_raw(&bytes) for pre-encoded data
+writer.finalize(SigmfWriterMeta {
+    sample_rate_hz: 20_000_000.0,
+    hardware: Some("HackRF One".into()),
+    description: Some("Live capture".into()),
+    recorder: Some("orecchiette (my-tool)".into()),
+    captures: vec![SigmfCapture {
+        sample_start: 0,
+        frequency_hz: Some(915_000_000.0),
+        datetime_rfc3339: Some(chrono::Utc::now().to_rfc3339()),
+        geolocation: None,
+    }],
+})?;
+```
+
+- `write_raw(&[u8])` passes already-encoded wire bytes straight through —
+  the fast path for sources that hand back bytes already in the on-disk
+  format (e.g. HackRF's native `ci8`).
+- `write_samples(&[Complex32])` encodes per the writer's `DataType`
+  (`Cf32Le` is a direct little-endian byte view; `Ci16Le`/`Ci8` scale
+  from the unit disc, mirroring the reader's decode conventions).
+- `finalize()` flushes the data file and writes the paired `.sigmf-meta`
+  JSON with a consistent field set (`core:datatype`, `core:version`,
+  `core:hw`, `core:description`, `core:recorder`, `captures[]`).
+
 ## MSRV & Semver Policy
 
 - **MSRV:** This crate does not maintain an explicit Minimum Supported Rust Version (MSRV) policy and tracks the latest `stable` compiler.
@@ -108,15 +143,17 @@ guess are ignored — SigMF metadata is the source of truth.
 
 ## Testing & Contributing
 
-14 tests cover:
+22 tests cover:
 
 - raw `i16`/`f32` decoders (round-trip + scaling).
 - SigMF metadata parse: minimal, full, unknown namespaces, missing
-  captures, unsupported datatype rejection.
+  captures, missing `core:version`, unsupported datatype rejection.
 - `resolve_pair` from either side and the bare basename; the missing-
   sibling error path.
 - `looks_like_sigmf` recognises `.sigmf-meta` / `.sigmf-data` / bare
   base names and rejects unrelated extensions.
+- `SigmfWriter` round-trips through `cf32_le` and `ci8`, and passes
+  pre-encoded bytes straight through via `write_raw`.
 - End-to-end `sigmf_file_source_round_trip` writes a synthetic
   `cf32_le` SigMF pair, runs it through `SigmfFileSource`, and drains
   three packets, verifying centre frequency and sample rate

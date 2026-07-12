@@ -79,4 +79,30 @@ the source actually consults:
 | `sigmf::looks_like_sigmf(path) -> bool` | Predicate used by the SDR applications `file` subcommand dispatcher to decide whether to route a path through `SigmfFileSource` instead of `RawIqFileSource`. |
 | `SigmfMetadata::load(meta_path)` | Read + parse a `.sigmf-meta` JSON file. |
 | `DataType::from_spec(s)` | `cf32_le` / `ci16_le` → enum, anything else → error. |
+| `DataType::to_spec(self) -> &str` | Inverse of `from_spec`, for tagging `core:datatype` on write. |
 | `DataType::decode(bytes) -> Vec<Complex32>` | Pure decoder, allocation-per-call (1 MB chunks are decoded into 131 072-sample vectors). |
+
+### `SigmfWriter`
+
+Every SigMF-producing binary across the orecchiette ecosystem
+(`rtsa2sigmf`, `usrp2sigmf`, `hackrf2sigmf`, `synthetic_fpv`) used to
+hand-roll its own `.sigmf-data`/`.sigmf-meta` pair, and had already
+drifted on `BufWriter` capacity, the metadata field set, and duplicated
+`unsafe` byte casts of `Complex32` sample buffers. `SigmfWriter` is the
+single implementation those binaries now share:
+
+- `SigmfWriter::create(base_path, datatype)` opens `.sigmf-data` with a
+  16 MiB `BufWriter` (the capacity every recorder had already converged
+  on for real-time throughput) and remembers the `.sigmf-meta` sibling
+  path.
+- `write_raw(&[u8])` is a byte passthrough for sources that already
+  hand back on-disk-format bytes (HackRF's native `ci8`).
+- `write_samples(&[Complex32])` is the one reviewed occurrence of the
+  `Complex32`-to-bytes cast in the whole ecosystem (previously
+  duplicated per binary); `Ci16Le`/`Ci8` scale from the unit disc to
+  match the reader's decode conventions exactly (inverse operations).
+- `finalize(SigmfWriterMeta)` flushes the data file and writes the
+  metadata JSON — `core:datatype`/`core:sample_rate`/`core:version`
+  plus optional `core:hw`/`core:description`/`core:recorder` and a
+  `captures[]` array (each with optional frequency, datetime, and
+  GeoJSON `Point` geolocation).
