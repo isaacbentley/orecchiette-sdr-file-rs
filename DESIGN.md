@@ -105,4 +105,8 @@ single implementation those binaries now share:
   metadata JSON — `core:datatype`/`core:sample_rate`/`core:version`
   plus optional `core:hw`/`core:description`/`core:recorder` and a
   `captures[]` array (each with optional frequency, datetime, and
-  GeoJSON `Point` geolocation).
+  GeoJSON `Point` geolocation). `SigmfWriterMeta::annotations` passes
+  arbitrary JSON values through verbatim as the top-level `annotations`
+  array — the reader never parses annotation content, so this is a
+  pure passthrough for callers that want documented sample ranges
+  (e.g. ground-truth labels on a synthetic fixture).

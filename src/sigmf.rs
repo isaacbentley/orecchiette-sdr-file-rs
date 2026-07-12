@@ -183,6 +183,11 @@ pub struct SigmfWriterMeta {
     pub description: Option<String>,
     pub recorder: Option<String>,
     pub captures: Vec<SigmfCapture>,
+    /// Passed through verbatim as the top-level `annotations` array.
+    /// The reader (`SigmfMetadata`) doesn't parse annotation content —
+    /// callers that want documented sample ranges (e.g. ground-truth
+    /// labels for a synthetic fixture) can still emit them here.
+    pub annotations: Vec<serde_json::Value>,
 }
 
 /// Shared `.sigmf-data` + `.sigmf-meta` writer. Centralizes the buffer
@@ -313,7 +318,7 @@ impl SigmfWriter {
         let doc = serde_json::json!({
             "global": global,
             "captures": captures,
-            "annotations": [],
+            "annotations": meta.annotations,
         });
 
         let mut meta_file = fs::File::create(&self.meta_path)
@@ -616,6 +621,7 @@ mod tests {
                     datetime_rfc3339: Some("2026-01-01T00:00:00Z".into()),
                     geolocation: Some([-122.4, 37.8]),
                 }],
+                annotations: vec![],
             })
             .unwrap();
 
@@ -647,6 +653,7 @@ mod tests {
                 description: None,
                 recorder: None,
                 captures: vec![],
+                annotations: vec![],
             })
             .unwrap();
 
@@ -676,11 +683,39 @@ mod tests {
                 description: None,
                 recorder: None,
                 captures: vec![],
+                annotations: vec![],
             })
             .unwrap();
 
         let bytes = std::fs::read(base.with_extension("sigmf-data")).unwrap();
         assert_eq!(bytes, raw);
+    }
+
+    #[test]
+    fn sigmf_writer_passes_through_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("annotated");
+
+        let mut writer = SigmfWriter::create(&base, DataType::Cf32Le).unwrap();
+        writer.write_raw(&[]).unwrap();
+        writer
+            .finalize(SigmfWriterMeta {
+                sample_rate_hz: 1_000_000.0,
+                hardware: None,
+                description: None,
+                recorder: None,
+                captures: vec![],
+                annotations: vec![serde_json::json!({
+                    "core:sample_start": 0,
+                    "core:sample_count": 100,
+                    "core:label": "test-signal"
+                })],
+            })
+            .unwrap();
+
+        let body = std::fs::read_to_string(base.with_extension("sigmf-meta")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["annotations"][0]["core:label"], "test-signal");
     }
 
     #[test]

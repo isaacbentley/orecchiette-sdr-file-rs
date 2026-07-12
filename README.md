@@ -123,6 +123,7 @@ writer.finalize(SigmfWriterMeta {
         datetime_rfc3339: Some(chrono::Utc::now().to_rfc3339()),
         geolocation: None,
     }],
+    annotations: vec![],
 })?;
 ```
 
@@ -134,7 +135,10 @@ writer.finalize(SigmfWriterMeta {
   from the unit disc, mirroring the reader's decode conventions).
 - `finalize()` flushes the data file and writes the paired `.sigmf-meta`
   JSON with a consistent field set (`core:datatype`, `core:version`,
-  `core:hw`, `core:description`, `core:recorder`, `captures[]`).
+  `core:hw`, `core:description`, `core:recorder`, `captures[]`). Pass
+  through arbitrary `annotations` JSON values verbatim (e.g. documented
+  ground-truth sample ranges for a synthetic fixture) — the reader
+  doesn't parse their content, so any well-formed SigMF annotation works.
 
 ## MSRV & Semver Policy
 
@@ -143,7 +147,7 @@ writer.finalize(SigmfWriterMeta {
 
 ## Testing & Contributing
 
-22 tests cover:
+23 tests cover:
 
 - raw `i16`/`f32` decoders (round-trip + scaling).
 - SigMF metadata parse: minimal, full, unknown namespaces, missing
@@ -152,8 +156,9 @@ writer.finalize(SigmfWriterMeta {
   sibling error path.
 - `looks_like_sigmf` recognises `.sigmf-meta` / `.sigmf-data` / bare
   base names and rejects unrelated extensions.
-- `SigmfWriter` round-trips through `cf32_le` and `ci8`, and passes
-  pre-encoded bytes straight through via `write_raw`.
+- `SigmfWriter` round-trips through `cf32_le` and `ci8`, passes
+  pre-encoded bytes straight through via `write_raw`, and passes
+  arbitrary `annotations` through verbatim.
 - End-to-end `sigmf_file_source_round_trip` writes a synthetic
   `cf32_le` SigMF pair, runs it through `SigmfFileSource`, and drains
   three packets, verifying centre frequency and sample rate
