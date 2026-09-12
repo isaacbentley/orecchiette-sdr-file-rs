@@ -19,7 +19,7 @@ graph TD
     D --> E
     E --> F[Read 1MB Chunk]
     F --> G[Decode to Complex32]
-    G --> H[Emit 262,144-sample IqPacket]
+    G --> H[Emit 1,048,576-sample IqPacket]
     H --> I{EOF?}
     I -->|No| F
     I -->|Yes| J[Stop]
@@ -30,7 +30,10 @@ graph TD
 SDR detection applications worker threads are optimized for batch processing. Both file backends:
 - Read raw bytes from disk in large 1 MB chunks for I/O efficiency.
 - Decode the specific data type (`i16`, `f32`) into `Complex32` samples.
-- Slice the decoded data into consistent 262,144-sample packets, each wrapped in a `PooledIqBuffer` for zero-allocation recycling.
+- Slice the decoded data into consistent 1,048,576-sample packets, each wrapped in a `PooledIqBuffer` for zero-allocation recycling.
+- Allocate sample storage on demand with an eight-packet queue (up to 64 MiB)
+  and an eight-buffer recycler (up to another 64 MiB). Decoder working memory
+  and packets retained by consumers are additional to these limits.
 - Maintain a stateful remainder buffer to stitch partial samples across 1 MB read boundaries, ensuring no IQ pair is ever split.
 
 ## 3. RawIqFileSource
@@ -46,10 +49,13 @@ Headerless recordings have no self-describing metadata.
 The [Signal Metadata Format (SigMF)](https://github.com/sigmf/sigmf-spec) provides a structured JSON sidecar (`.sigmf-meta`) describing the raw binary payload (`.sigmf-data`).
 
 ### Resolution and Parsing
-1. **Pair Resolution**: The backend accepts either the `.sigmf-meta` path, the `.sigmf-data` path, or the bare basename, and automatically resolves the sibling file.
-2. **JSON Deserialization**: Uses `serde_json` to parse the metadata. Unrecognized namespaces and extension fields are ignored (`serde(default)`), ensuring forward compatibility.
+1. **Pair Resolution**: The backend accepts either the `.sigmf-meta` path, the `.sigmf-data` path, or the bare basename, and automatically resolves the sibling file. Dots in basenames are preserved;
+   only recognized SigMF suffixes are stripped.
+2. **JSON Deserialization**: Uses `serde_json` to parse the metadata. Unknown
+   fields are ignored, while `core:num_channels` must be absent or equal to 1.
+   Unsupported channel counts are rejected before samples are decoded.
 3. **Parameter Extraction**:
-   - `global.core:datatype` dictates the decoding path (`cf32_le` or `ci16_le`).
+   - `global.core:datatype` dictates the decoding path (`cf32_le`, `ci16_le`, or `ci8`).
    - `global.core:sample_rate` populates `IqPacket::sample_rate_hz`.
    - `captures[0].core:frequency` populates `IqPacket::center_frequency_hz`.
 
@@ -64,8 +70,9 @@ the source actually consults:
 
 | JSON path | Used for |
 |---|---|
-| `global.core:datatype` | datatype dispatch (`cf32_le` / `ci16_le`) |
-| `global.core:sample_rate` | `IqPacket::sample_rate_hz` |
+| `global.core:datatype` | datatype dispatch (`cf32_le` / `ci16_le` / `ci8`) |
+| `global.core:sample_rate` | `IqPacket::sample_rate_hz`; must remain finite and positive as `f32` |
+| `global.core:num_channels` | Reject values other than 1; omission defaults to 1 |
 | `global.core:version` | parsed, not range-checked |
 | `captures[].core:frequency` | `IqPacket::center_frequency_hz` (first capture wins) |
 | `captures[].core:sample_start` | parsed (multi-capture support hook; not yet used to split packets) |
@@ -78,7 +85,7 @@ the source actually consults:
 | `sigmf::resolve_pair(path) -> (meta, data)` | Resolve a `.sigmf-meta` / `.sigmf-data` / bare-basename input to the pair of paths, erroring if the data sibling is missing. |
 | `sigmf::looks_like_sigmf(path) -> bool` | Predicate used by the SDR applications `file` subcommand dispatcher to decide whether to route a path through `SigmfFileSource` instead of `RawIqFileSource`. |
 | `SigmfMetadata::load(meta_path)` | Read + parse a `.sigmf-meta` JSON file. |
-| `DataType::from_spec(s)` | `cf32_le` / `ci16_le` → enum, anything else → error. |
+| `DataType::from_spec(s)` | `cf32_le` / `ci16_le` / `ci8` → enum, anything else → error. |
 | `DataType::to_spec(self) -> &str` | Inverse of `from_spec`, for tagging `core:datatype` on write. |
 | `DataType::decode(bytes) -> Vec<Complex32>` | Pure decoder, allocation-per-call (1 MB chunks are decoded into 131 072-sample vectors). |
 
@@ -97,11 +104,13 @@ single implementation those binaries now share:
   path.
 - `write_raw(&[u8])` is a byte passthrough for sources that already
   hand back on-disk-format bytes (HackRF's native `ci8`).
-- `write_samples(&[Complex32])` is the one reviewed occurrence of the
-  `Complex32`-to-bytes cast in the whole ecosystem (previously
-  duplicated per binary); `Ci16Le`/`Ci8` scale from the unit disc to
-  match the reader's decode conventions exactly (inverse operations).
-- `finalize(SigmfWriterMeta)` flushes the data file and writes the
+- `write_samples(&[Complex32])` uses the `Complex32`-to-bytes cast only
+  on little-endian hosts. Big-endian hosts encode explicitly into a 64 KiB
+  scratch buffer. Both paths are tested for exact byte output.
+  `Ci16Le`/`Ci8` scale from the unit disc to match the reader's decode conventions exactly (inverse operations).
+- `finalize(SigmfWriterMeta)` first validates that sample rates are usable
+  for playback and that frequencies and coordinates are finite. It preserves
+  signed and fractional frequencies, flushes the data file, and writes the
   metadata JSON — `core:datatype`/`core:sample_rate`/`core:version`
   plus optional `core:hw`/`core:description`/`core:recorder` and a
   `captures[]` array (each with optional frequency, datetime, and

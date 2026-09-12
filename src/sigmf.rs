@@ -16,6 +16,7 @@
 //! * `.sigmf` tar archives — only the unpacked meta+data file pair
 //!   is supported.
 //! * `.sigmf-collection` multi-recording metadata.
+//! * Multichannel datasets (`core:num_channels` other than 1 are rejected).
 //! * Annotations (per-sample marks).
 //! * Per-capture frequency switching mid-stream — the first
 //!   capture's frequency tags every emitted packet.
@@ -49,24 +50,56 @@ pub struct SigmfMetadata {
 }
 
 /// Global object — applies to the entire recording.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Global {
-    #[serde(rename = "core:datatype")]
     pub datatype: String,
-    #[serde(rename = "core:sample_rate")]
     pub sample_rate: f64,
-    /// `core:version` is spec-mandatory, but some real-world writers
-    /// omit it. Default to empty rather than rejecting an otherwise
-    /// usable capture — nothing here reads this field for anything
-    /// but display/passthrough.
-    #[serde(rename = "core:version", default)]
+    /// Missing versions default to empty for compatibility with older writers.
     pub version: String,
-    #[serde(rename = "core:description", default)]
     pub description: Option<String>,
-    #[serde(rename = "core:hw", default)]
     pub hardware: Option<String>,
-    #[serde(rename = "core:author", default)]
     pub author: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Global {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Keep the public fields unchanged while validating the on-disk layout.
+        #[derive(Deserialize)]
+        struct Fields {
+            #[serde(rename = "core:datatype")]
+            datatype: String,
+            #[serde(rename = "core:sample_rate")]
+            sample_rate: f64,
+            #[serde(rename = "core:version", default)]
+            version: String,
+            #[serde(rename = "core:description", default)]
+            description: Option<String>,
+            #[serde(rename = "core:hw", default)]
+            hardware: Option<String>,
+            #[serde(rename = "core:author", default)]
+            author: Option<String>,
+            #[serde(rename = "core:num_channels", default = "single_channel")]
+            num_channels: u64,
+        }
+        fn single_channel() -> u64 {
+            1
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        if fields.num_channels != 1 {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported core:num_channels {}: only single-channel recordings are supported",
+                fields.num_channels
+            )));
+        }
+        Ok(Self {
+            datatype: fields.datatype,
+            sample_rate: fields.sample_rate,
+            version: fields.version,
+            description: fields.description,
+            hardware: fields.hardware,
+            author: fields.author,
+        })
+    }
 }
 
 /// One contiguous span of samples in the data file. Recordings with
@@ -209,9 +242,10 @@ impl SigmfWriter {
     /// Create a new `.sigmf-data` file (and remember where its sibling
     /// `.sigmf-meta` belongs) for `base_path`, e.g. `base_path =
     /// "capture"` produces `capture.sigmf-data` / `capture.sigmf-meta`.
+    /// Dots in basenames are preserved; an existing `.sigmf-data` or
+    /// `.sigmf-meta` suffix is normalized to the same recording pair.
     pub fn create(base_path: &Path, datatype: DataType) -> Result<Self> {
-        let data_path = base_path.with_extension("sigmf-data");
-        let meta_path = base_path.with_extension("sigmf-meta");
+        let (meta_path, data_path) = pair_paths(base_path);
         let file = fs::File::create(&data_path)
             .with_context(|| format!("create SigMF data file {}", data_path.display()))?;
         Ok(Self {
@@ -230,12 +264,14 @@ impl SigmfWriter {
     }
 
     /// Encode and write `Complex32` samples per this writer's
-    /// [`DataType`]. `Cf32Le` is a straight little-endian byte cast
-    /// (sound: `Complex32` is `#[repr(C)]` two `f32`s, and this is the
-    /// crate's single reviewed occurrence of that cast rather than one
-    /// copy per binary); `Ci16Le`/`Ci8` scale from the unit disc.
+    /// [`DataType`]. `Cf32Le` uses a byte view on little-endian hosts
+    /// and explicit little-endian encoding elsewhere; `Ci16Le`/`Ci8`
+    /// scale from the unit disc.
     pub fn write_samples(&mut self, samples: &[Complex32]) -> Result<()> {
         match self.datatype {
+            #[cfg(target_endian = "big")]
+            DataType::Cf32Le => self.write_cf32_le_portable(samples),
+            #[cfg(target_endian = "little")]
             DataType::Cf32Le => {
                 // SAFETY: `Complex32` (`num_complex::Complex<f32>`) is
                 // `#[repr(C)]` with two `f32` fields and no padding, so
@@ -274,9 +310,38 @@ impl SigmfWriter {
         }
     }
 
+    // Also compiled in tests so the big-endian host's encoding path is
+    // exercised on little-endian CI machines.
+    #[cfg(any(target_endian = "big", test))]
+    fn write_cf32_le_portable(&mut self, samples: &[Complex32]) -> Result<()> {
+        let mut buffer = [0u8; 64 * 1024];
+        for chunk in samples.chunks(buffer.len() / 8) {
+            for (sample, bytes) in chunk.iter().zip(buffer.as_chunks_mut::<8>().0.iter_mut()) {
+                bytes[..4].copy_from_slice(&sample.re.to_le_bytes());
+                bytes[4..].copy_from_slice(&sample.im.to_le_bytes());
+            }
+            self.write_raw(&buffer[..chunk.len() * 8])?;
+        }
+        Ok(())
+    }
+
     /// Flush the data file and write the paired `.sigmf-meta` JSON.
+    /// Rejects sample rates that cannot be played back and non-finite
+    /// capture frequencies or geolocation coordinates.
     pub fn finalize(mut self, meta: SigmfWriterMeta) -> Result<()> {
         use std::io::Write;
+        crate::packet_sample_rate(meta.sample_rate_hz).map_err(|e| anyhow!(e))?;
+        for capture in &meta.captures {
+            if capture.frequency_hz.is_some_and(|f| !f.is_finite()) {
+                return Err(anyhow!("capture frequency must be finite"));
+            }
+            if capture
+                .geolocation
+                .is_some_and(|point| point.iter().any(|v| !v.is_finite()))
+            {
+                return Err(anyhow!("capture geolocation coordinates must be finite"));
+            }
+        }
         self.data.flush().context("flush SigMF data file")?;
 
         let mut global = serde_json::json!({
@@ -300,7 +365,7 @@ impl SigmfWriter {
             .map(|c| {
                 let mut v = serde_json::json!({ "core:sample_start": c.sample_start });
                 if let Some(f) = c.frequency_hz {
-                    v["core:frequency"] = serde_json::json!(f.round() as u64);
+                    v["core:frequency"] = serde_json::json!(f);
                 }
                 if let Some(dt) = &c.datetime_rfc3339 {
                     v["core:datetime"] = serde_json::json!(dt);
@@ -344,7 +409,7 @@ impl SigmfMetadata {
         self.captures.first().and_then(|c| c.frequency)
     }
 
-    /// Global sample rate in Hz. Mandatory per the spec.
+    /// Global sample rate in Hz. Required by this reader for playback.
     pub fn sample_rate_hz(&self) -> f64 {
         self.global.sample_rate
     }
@@ -355,28 +420,28 @@ impl SigmfMetadata {
     }
 }
 
-/// Given a SigMF-related path (`.sigmf-meta`, `.sigmf-data`, or the
-/// bare basename with no extension), return the `(meta, data)` pair.
-/// The orchestrator passes whichever filename the user globbed.
-pub fn resolve_pair(path: &Path) -> Result<(PathBuf, PathBuf)> {
-    let s = path.to_string_lossy();
-    let (meta, data) = if let Some(base) = s.strip_suffix(".sigmf-meta") {
-        (
-            path.to_path_buf(),
-            PathBuf::from(format!("{base}.sigmf-data")),
-        )
-    } else if let Some(base) = s.strip_suffix(".sigmf-data") {
-        (
-            PathBuf::from(format!("{base}.sigmf-meta")),
-            path.to_path_buf(),
-        )
+// Append suffixes without treating dots in a recording basename as extensions
+// or replacing non-UTF-8 path bytes. Only known SigMF suffixes are stripped.
+fn pair_paths(path: &Path) -> (PathBuf, PathBuf) {
+    let base = if path
+        .extension()
+        .is_some_and(|ext| ext == "sigmf-meta" || ext == "sigmf-data")
+    {
+        path.with_extension("")
     } else {
-        // Bare basename: assume both siblings exist.
-        (
-            PathBuf::from(format!("{s}.sigmf-meta")),
-            PathBuf::from(format!("{s}.sigmf-data")),
-        )
+        path.to_path_buf()
     };
+    let mut meta = base.as_os_str().to_os_string();
+    meta.push(".sigmf-meta");
+    let mut data = base.into_os_string();
+    data.push(".sigmf-data");
+    (PathBuf::from(meta), PathBuf::from(data))
+}
+
+/// Given a `.sigmf-meta`, `.sigmf-data`, or recording basename (which
+/// may contain dots), return the `(meta, data)` pair.
+pub fn resolve_pair(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    let (meta, data) = pair_paths(path);
     if !meta.exists() {
         return Err(anyhow!(
             "SigMF metadata file not found: {} (looked up from {})",
@@ -397,19 +462,72 @@ pub fn resolve_pair(path: &Path) -> Result<(PathBuf, PathBuf)> {
 /// `true` if the path looks like a SigMF artefact (meta, data, or
 /// a recording basename with both siblings present).
 pub fn looks_like_sigmf(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    if s.ends_with(".sigmf-meta") || s.ends_with(".sigmf-data") {
+    if path
+        .extension()
+        .is_some_and(|ext| ext == "sigmf-meta" || ext == "sigmf-data")
+    {
         return true;
     }
-    // Bare basename with both siblings present.
-    PathBuf::from(format!("{s}.sigmf-meta")).exists()
-        && PathBuf::from(format!("{s}.sigmf-data")).exists()
+    let (meta, data) = pair_paths(path);
+    meta.exists() && data.exists()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn both_cf32_encoders_write_exact_little_endian_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let patterns = [
+            0x3f80_0000,
+            0x8000_0000,
+            0x7f80_0000,
+            0x7fc0_1234,
+            0x0000_0001,
+        ];
+        // Cross the portable encoder's 64 KiB buffer boundary, including a tail.
+        let samples: Vec<_> = (0..8193)
+            .map(|i| {
+                Complex32::new(
+                    f32::from_bits(patterns[i % patterns.len()]),
+                    f32::from_bits(patterns[(i + 1) % patterns.len()]),
+                )
+            })
+            .collect();
+        let expected: Vec<_> = samples
+            .iter()
+            .flat_map(|s| s.re.to_le_bytes().into_iter().chain(s.im.to_le_bytes()))
+            .collect();
+        for portable in [false, true] {
+            let base = dir
+                .path()
+                .join(if portable { "portable" } else { "native" });
+            let mut writer = SigmfWriter::create(&base, DataType::Cf32Le).unwrap();
+            if portable {
+                writer.write_cf32_le_portable(&[]).unwrap();
+                writer.write_cf32_le_portable(&samples).unwrap();
+            } else {
+                writer.write_samples(&[]).unwrap();
+                writer.write_samples(&samples).unwrap();
+            }
+            writer
+                .finalize(SigmfWriterMeta {
+                    sample_rate_hz: 1e6,
+                    hardware: None,
+                    description: None,
+                    recorder: None,
+                    captures: vec![],
+                    annotations: vec![],
+                })
+                .unwrap();
+            assert_eq!(
+                std::fs::read(base.with_extension("sigmf-data")).unwrap(),
+                expected
+            );
+        }
+    }
 
     fn write_meta(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(format!("{name}.sigmf-meta"));

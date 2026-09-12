@@ -19,9 +19,13 @@ back at its natural rate. They accept `DwellAdvice` at the trait
 boundary and ignore it.
 
 Each backend streams the data in 1 MB I/O chunks, decodes into
-`Complex32`, and emits 262 144-sample `IqPacket`s to match a
+`Complex32`, and emits 1 048 576-sample `IqPacket`s to match a
 typical worker pool's batch expectation. Partial samples at chunk
-boundaries are stitched across reads so no IQ pair is split.
+boundaries are stitched across reads so no IQ pair is split. Final partial
+packets are emitted at each file's end. Sample buffers are allocated on demand;
+the packet queue holds at most eight packets (64 MiB when full), and the
+recycler retains at most eight buffers (another 64 MiB). Decoder working memory
+and packets retained by consumers are additional to these limits.
 
 ## Installation
 
@@ -65,7 +69,9 @@ The format is decided by the file's extension:
 
 If you pass multiple paths, they're played sequentially.
 `config.sample_rate_hz` is the assumed playback rate; the caller is
-responsible for setting it to match how the file was recorded.
+responsible for setting it to match how the file was recorded. Rates must be
+finite and positive, and remain finite and positive when converted to the
+packet's `f32` sample-rate field.
 
 ## SigmfFileSource
 
@@ -92,11 +98,17 @@ For each path, the source:
 3. Picks the datatype (`global.core:datatype`):
    - `cf32_le` → interleaved IEEE-754 f32, 8 bytes per IQ pair.
    - `ci16_le` → interleaved i16 LE, 4 bytes per IQ pair, scaled by `1/32768`.
-   - anything else fails fast with a typed error.
+   - `ci8` → interleaved i8, 2 bytes per IQ pair, scaled by `1/127`.
+   - other datatypes are rejected; the source logs a warning and skips the file.
 4. Streams `.sigmf-data` and emits packets tagged with
    `captures[].core:frequency` (uses the first capture; multi-capture
    recordings are read end-to-end). Sample rate comes from
    `global.core:sample_rate`.
+
+Only single-channel recordings are supported. Metadata with
+`core:num_channels` other than 1 is rejected; an omitted field means 1.
+Invalid metadata and sample rates are logged and skipped during playback,
+allowing subsequent files to play.
 
 The caller's `config.sample_rate_hz` and any per-packet centre-frequency
 guess are ignored — SigMF metadata is the source of truth.
@@ -131,10 +143,16 @@ writer.finalize(SigmfWriterMeta {
   the fast path for sources that hand back bytes already in the on-disk
   format (e.g. HackRF's native `ci8`).
 - `write_samples(&[Complex32])` encodes per the writer's `DataType`
-  (`Cf32Le` is a direct little-endian byte view; `Ci16Le`/`Ci8` scale
+  (`Cf32Le` uses a byte view on little-endian hosts and explicit encoding
+  on big-endian hosts; `Ci16Le`/`Ci8` scale
   from the unit disc, mirroring the reader's decode conventions).
-- `finalize()` flushes the data file and writes the paired `.sigmf-meta`
-  JSON with a consistent field set (`core:datatype`, `core:version`,
+- `create()` preserves dots in recording basenames (`capture.001` becomes
+  `capture.001.sigmf-data`), and accepts either SigMF suffix to identify the
+  same pair. Creating the same recording again still truncates its data file.
+- `finalize()` validates sample rates using the playback requirements above,
+  rejects non-finite frequencies and geolocation coordinates, and preserves
+  signed and fractional frequencies. It then flushes the data file and writes
+  the paired `.sigmf-meta` JSON with a consistent field set (`core:datatype`, `core:version`,
   `core:hw`, `core:description`, `core:recorder`, `captures[]`). Pass
   through arbitrary `annotations` JSON values verbatim (e.g. documented
   ground-truth sample ranges for a synthetic fixture) — the reader
@@ -147,9 +165,14 @@ writer.finalize(SigmfWriterMeta {
 
 ## Testing & Contributing
 
-23 tests cover:
+Tests cover:
 
 - raw `i16`/`f32` decoders (round-trip + scaling).
+- lazy allocation and bounded packet queues for both playback sources.
+- invalid sample rates, unsupported channel counts, dotted recording names,
+  signed/fractional frequencies, and rejection of invalid writer metadata.
+- exact float encoding in both the native and portable little-endian paths,
+  including signed zero, infinities, NaN payloads, and buffer boundaries.
 - SigMF metadata parse: minimal, full, unknown namespaces, missing
   captures, missing `core:version`, unsupported datatype rejection.
 - `resolve_pair` from either side and the bare basename; the missing-

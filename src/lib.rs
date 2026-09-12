@@ -35,6 +35,19 @@ pub use sigmf::{DataType as SigmfDataType, SigmfMetadata, looks_like_sigmf};
 
 const IO_BUFFER_BYTES: usize = 1024 * 1024;
 const PACKET_SAMPLES: usize = 1_048_576;
+// At most 64 MiB of full packets queued and 64 MiB of recycled buffers.
+// Sample storage is allocated lazily; consumers own any packets they retain.
+const PACKET_QUEUE_CAPACITY: usize = 8;
+
+fn packet_sample_rate(rate: f64) -> Result<f32, &'static str> {
+    let packet_rate = rate as f32;
+    if !rate.is_finite() || !packet_rate.is_finite() || packet_rate <= 0.0 {
+        return Err(
+            "sample_rate_hz must be finite, positive, and representable as a positive finite f32",
+        );
+    }
+    Ok(packet_rate)
+}
 
 /// Raw-IQ file source. Accepts one or more pre-globbed paths and
 /// streams them sequentially.
@@ -57,22 +70,15 @@ impl SdrSource for RawIqFileSource {
                 "RawIqFileSource: no paths to play".into(),
             ));
         }
-        if config.sample_rate_hz <= 0.0 {
-            return Err(SdrError::BadConfig(
-                "RawIqFileSource: sample_rate_hz must be > 0".into(),
-            ));
-        }
-        let (tx, receiver) = channel::bounded::<IqPacket>(1024);
+        let rate = packet_sample_rate(config.sample_rate_hz)
+            .map_err(|e| SdrError::BadConfig(format!("RawIqFileSource: {e}")))?;
+        let (tx, receiver) = channel::bounded::<IqPacket>(PACKET_QUEUE_CAPACITY);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_for_thread = stop_flag.clone();
         let paths = self.paths.clone();
         let center = self.center_frequency_hz;
-        let rate = config.sample_rate_hz as f32;
 
-        let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(1024);
-        for _ in 0..1024 {
-            let _ = pool_tx.send(Vec::with_capacity(PACKET_SAMPLES));
-        }
+        let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(PACKET_QUEUE_CAPACITY);
 
         let capture_thread = thread::spawn(move || {
             let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -123,10 +129,9 @@ impl SdrSource for RawIqFileSource {
                                     );
                                 }
                                 if !leftovers.is_empty() {
-                                    let mut pooled = pool_rx
-                                        .try_recv()
-                                        .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
+                                    let mut pooled = pool_rx.try_recv().unwrap_or_default();
                                     pooled.clear();
+                                    pooled.reserve_exact(leftovers.len());
                                     pooled.extend_from_slice(&leftovers);
                                     leftovers.clear();
                                     let pkt = IqPacket {
@@ -163,10 +168,9 @@ impl SdrSource for RawIqFileSource {
                                     leftovers.extend_from_slice(chunk);
                                     break;
                                 }
-                                let mut pooled = pool_rx
-                                    .try_recv()
-                                    .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
+                                let mut pooled = pool_rx.try_recv().unwrap_or_default();
                                 pooled.clear();
+                                pooled.reserve_exact(chunk.len());
                                 pooled.extend_from_slice(chunk);
                                 let pkt = IqPacket {
                                     samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
@@ -218,7 +222,7 @@ impl SdrSource for RawIqFileSource {
 /// truth for centre frequency, and `IqPacket`s are tagged accordingly.
 pub struct SigmfFileSource {
     /// Each path is either a `.sigmf-meta`, a `.sigmf-data`, or a
-    /// bare recording basename (no extension) whose `.sigmf-meta` and
+    /// recording basename (which may contain dots) whose `.sigmf-meta` and
     /// `.sigmf-data` siblings both exist.
     pub paths: Vec<PathBuf>,
 }
@@ -234,15 +238,12 @@ impl SdrSource for SigmfFileSource {
                 "SigmfFileSource: no paths to play".into(),
             ));
         }
-        let (tx, receiver) = channel::bounded::<IqPacket>(1024);
+        let (tx, receiver) = channel::bounded::<IqPacket>(PACKET_QUEUE_CAPACITY);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_for_thread = stop_flag.clone();
         let paths = self.paths.clone();
 
-        let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(1024);
-        for _ in 0..1024 {
-            let _ = pool_tx.send(Vec::with_capacity(PACKET_SAMPLES));
-        }
+        let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(PACKET_QUEUE_CAPACITY);
 
         let capture_thread = thread::spawn(move || {
             let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -280,15 +281,13 @@ impl SdrSource for SigmfFileSource {
                             0.0
                         });
                         let sample_rate = meta.sample_rate_hz();
-                        if sample_rate <= 0.0 {
-                            warn!(
-                                "sigmf: invalid sample rate {} Hz in {}; skipping file",
-                                sample_rate,
-                                meta_path.display()
-                            );
-                            continue;
-                        }
-                        let sample_rate_f32 = sample_rate as f32;
+                        let sample_rate_f32 = match packet_sample_rate(sample_rate) {
+                            Ok(rate) => rate,
+                            Err(e) => {
+                                warn!("sigmf: {}: {e}; skipping file", meta_path.display());
+                                continue;
+                            }
+                        };
                         info!(
                             "sigmf: playing {} ({}, {} MHz @ {:.3} MSPS)",
                             data_path.display(),
@@ -326,10 +325,9 @@ impl SdrSource for SigmfFileSource {
                                     );
                                 }
                                 if !leftovers.is_empty() {
-                                    let mut pooled = pool_rx
-                                        .try_recv()
-                                        .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
+                                    let mut pooled = pool_rx.try_recv().unwrap_or_default();
                                     pooled.clear();
+                                    pooled.reserve_exact(leftovers.len());
                                     pooled.extend_from_slice(&leftovers);
                                     leftovers.clear();
                                     let pkt = IqPacket {
@@ -368,10 +366,9 @@ impl SdrSource for SigmfFileSource {
                                     leftovers.extend_from_slice(chunk);
                                     break;
                                 }
-                                let mut pooled = pool_rx
-                                    .try_recv()
-                                    .unwrap_or_else(|_| Vec::with_capacity(PACKET_SAMPLES));
+                                let mut pooled = pool_rx.try_recv().unwrap_or_default();
                                 pooled.clear();
+                                pooled.reserve_exact(chunk.len());
                                 pooled.extend_from_slice(chunk);
                                 let pkt = IqPacket {
                                     samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
@@ -419,7 +416,9 @@ impl SdrSource for SigmfFileSource {
 fn decode_block(bytes: &[u8], is_bin: bool) -> Vec<Complex32> {
     if is_bin {
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let re = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
                 let im = i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0;
@@ -428,7 +427,9 @@ fn decode_block(bytes: &[u8], is_bin: bool) -> Vec<Complex32> {
             .collect()
     } else {
         bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|c| {
                 let re = f32::from_le_bytes(c[0..4].try_into().unwrap());
                 let im = f32::from_le_bytes(c[4..8].try_into().unwrap());
