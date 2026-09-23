@@ -7,9 +7,10 @@
 //! * Parses the JSON `.sigmf-meta` file into [`SigmfMetadata`].
 //! * Decodes the paired `.sigmf-data` payload as one of the
 //!   [`DataType`] variants.
-//! * Surfaces the global sample rate and the first capture's centre
-//!   frequency as the canonical values for downstream IQ-packet
-//!   tagging.
+//! * Surfaces the global sample rate and each capture's centre
+//!   frequency for downstream IQ-packet tagging. Playback cuts packets
+//!   at every capture's `core:sample_start`, so a multi-capture
+//!   recording is labelled capture by capture.
 //!
 //! Out of scope for this version:
 //!
@@ -18,8 +19,6 @@
 //! * `.sigmf-collection` multi-recording metadata.
 //! * Multichannel datasets (`core:num_channels` other than 1 are rejected).
 //! * Annotations (per-sample marks).
-//! * Per-capture frequency switching mid-stream — the first
-//!   capture's frequency tags every emitted packet.
 //! * Datatypes other than `cf32_le`, `ci16_le`, and `ci8` (the formats
 //!   that account for nearly every real-world capture). The reader
 //!   surfaces a clear "unsupported datatype" error for the rest.
@@ -127,7 +126,9 @@ pub enum DataType {
     /// Scaled by `1 / 32768.0` on decode so the resulting `Complex32`
     /// matches the unit-disc convention every other source emits.
     Ci16Le,
-    /// `ci8` — interleaved signed 8-bit integers.
+    /// `ci8` — interleaved signed 8-bit integers, scaled by `1 / 128.0`
+    /// — the same full scale as live HackRF input, so a recording
+    /// replays at the level it was captured at.
     Ci8,
 }
 
@@ -145,29 +146,33 @@ impl DataType {
     /// The buffer length must be a multiple of `bytes_per_sample()`;
     /// trailing partial bytes are silently dropped.
     pub fn decode(self, bytes: &[u8]) -> Vec<Complex32> {
-        let n = self.bytes_per_sample();
-        let pairs = bytes.len() / n;
-        let mut out = Vec::with_capacity(pairs);
-        for chunk in bytes.chunks_exact(n) {
-            out.push(match self {
-                DataType::Cf32Le => {
-                    let re = f32::from_le_bytes(chunk[0..4].try_into().unwrap());
-                    let im = f32::from_le_bytes(chunk[4..8].try_into().unwrap());
-                    Complex32::new(re, im)
-                }
-                DataType::Ci16Le => {
-                    let re = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
-                    let im = i16::from_le_bytes([chunk[2], chunk[3]]) as f32 / 32768.0;
-                    Complex32::new(re, im)
-                }
-                DataType::Ci8 => {
-                    let re = (chunk[0] as i8) as f32 / 127.0;
-                    let im = (chunk[1] as i8) as f32 / 127.0;
-                    Complex32::new(re, im)
-                }
-            });
-        }
+        let mut out = Vec::new();
+        self.decode_into(bytes, &mut out);
         out
+    }
+
+    /// [`DataType::decode`], appending to `out` so a caller can reuse
+    /// one buffer across reads.
+    pub fn decode_into(self, bytes: &[u8], out: &mut Vec<Complex32>) {
+        let chunks = bytes.chunks_exact(self.bytes_per_sample());
+        // One loop per datatype, so the per-sample body is branch-free.
+        match self {
+            DataType::Cf32Le => out.extend(chunks.map(|c| {
+                let re = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                let im = f32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+                Complex32::new(re, im)
+            })),
+            DataType::Ci16Le => out.extend(chunks.map(|c| {
+                let re = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
+                let im = i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0;
+                Complex32::new(re, im)
+            })),
+            DataType::Ci8 => out.extend(chunks.map(|c| {
+                let re = (c[0] as i8) as f32 / 128.0;
+                let im = (c[1] as i8) as f32 / 128.0;
+                Complex32::new(re, im)
+            })),
+        }
     }
 
     /// Parse a SigMF `core:datatype` string into a [`DataType`].
@@ -266,8 +271,29 @@ impl SigmfWriter {
     /// Encode and write `Complex32` samples per this writer's
     /// [`DataType`]. `Cf32Le` uses a byte view on little-endian hosts
     /// and explicit little-endian encoding elsewhere; `Ci16Le`/`Ci8`
-    /// scale from the unit disc.
+    /// scale from the unit disc by the same full scale the decoder
+    /// divides by (32768 / 128), rounding to nearest and saturating, so
+    /// decoding what was written returns every representable value
+    /// exactly. (Truncation with `as` biased every sample toward zero.)
+    ///
+    /// An integer datatype has no code for NaN or infinity, so a
+    /// non-finite sample is an error and nothing from that call is
+    /// written: `NaN as i16` is 0, which would record silence that was
+    /// never received, and saturating an infinity would record a
+    /// full-scale sample that was never received either. `Cf32Le`
+    /// represents both and writes them as given.
     pub fn write_samples(&mut self, samples: &[Complex32]) -> Result<()> {
+        if self.datatype != DataType::Cf32Le
+            && let Some(i) = samples
+                .iter()
+                .position(|s| !s.re.is_finite() || !s.im.is_finite())
+        {
+            anyhow::bail!(
+                "sample {i} is {} and {} has no code for a non-finite value",
+                samples[i],
+                self.datatype.to_spec()
+            );
+        }
         match self.datatype {
             #[cfg(target_endian = "big")]
             DataType::Cf32Le => self.write_cf32_le_portable(samples),
@@ -290,8 +316,14 @@ impl SigmfWriter {
             DataType::Ci16Le => {
                 let mut buf = Vec::with_capacity(samples.len() * 4);
                 for s in samples {
-                    let re = (s.re * 32768.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                    let im = (s.im * 32768.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                    let re = (s.re * 32768.0)
+                        .round()
+                        .clamp(i16::MIN as f32, i16::MAX as f32)
+                        as i16;
+                    let im = (s.im * 32768.0)
+                        .round()
+                        .clamp(i16::MIN as f32, i16::MAX as f32)
+                        as i16;
                     buf.extend_from_slice(&re.to_le_bytes());
                     buf.extend_from_slice(&im.to_le_bytes());
                 }
@@ -300,8 +332,8 @@ impl SigmfWriter {
             DataType::Ci8 => {
                 let mut buf = Vec::with_capacity(samples.len() * 2);
                 for s in samples {
-                    let re = (s.re * 127.0).clamp(i8::MIN as f32, i8::MAX as f32) as i8;
-                    let im = (s.im * 127.0).clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+                    let re = (s.re * 128.0).round().clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+                    let im = (s.im * 128.0).round().clamp(i8::MIN as f32, i8::MAX as f32) as i8;
                     buf.push(re as u8);
                     buf.push(im as u8);
                 }
@@ -402,11 +434,30 @@ impl SigmfMetadata {
             .with_context(|| format!("parse SigMF meta {}", meta_path.display()))
     }
 
-    /// First-capture centre frequency in Hz, or `None` if no captures
-    /// declare one. The orchestrator falls back to the user's
-    /// `--center-freq` for raw recordings missing this field.
+    /// Centre frequency in Hz of the recording's earliest capture — by
+    /// `core:sample_start`, not by position in the JSON array — or `None`
+    /// if that capture declares none. Where several captures share the
+    /// earliest start the last listed describes it, as in playback.
+    ///
+    /// A later capture's frequency is never substituted: it describes
+    /// other samples. Playback tags each capture with its own frequency.
     pub fn center_frequency_hz(&self) -> Option<f64> {
-        self.captures.first().and_then(|c| c.frequency)
+        let captures = self.captures_by_start();
+        let first = captures.first()?.sample_start;
+        captures
+            .into_iter()
+            .take_while(|c| c.sample_start == first)
+            .last()?
+            .frequency
+    }
+
+    /// The captures in `core:sample_start` order. The spec requires
+    /// ascending order; this tolerates writers that don't. The sort is
+    /// stable, so captures sharing a start keep their listed order.
+    pub(crate) fn captures_by_start(&self) -> Vec<&Capture> {
+        let mut captures: Vec<_> = self.captures.iter().collect();
+        captures.sort_by_key(|c| c.sample_start);
+        captures
     }
 
     /// Global sample rate in Hz. Required by this reader for playback.
@@ -588,15 +639,61 @@ mod tests {
     }
 
     #[test]
-    fn ci8_decode_scales_to_unit_disc() {
+    fn ci8_decode_uses_the_hackrf_full_scale() {
         let bytes = [
             127u8,        // re = 127
-            -127i8 as u8, // im = -127
+            -128i8 as u8, // im = -128
         ];
         let decoded = DataType::Ci8.decode(&bytes);
         assert_eq!(decoded.len(), 1);
-        assert!((decoded[0].re - 1.0).abs() < 1e-6);
-        assert!((decoded[0].im + 1.0).abs() < 1e-6);
+        assert_eq!(decoded[0].re, 127.0 / 128.0);
+        assert_eq!(decoded[0].im, -1.0);
+    }
+
+    /// Every integer code survives write → read, and a value between two
+    /// codes lands on the nearer one rather than the one toward zero.
+    #[test]
+    fn integer_writers_round_to_nearest_and_round_trip_every_code() {
+        let dir = tempfile::tempdir().unwrap();
+        for (datatype, scale, codes) in [
+            (DataType::Ci8, 128.0f32, (-128i32..=127).collect::<Vec<_>>()),
+            (
+                DataType::Ci16Le,
+                32768.0f32,
+                (-32768i32..=32767).collect::<Vec<_>>(),
+            ),
+        ] {
+            let exact: Vec<_> = codes
+                .iter()
+                .map(|&c| Complex32::new(c as f32 / scale, -(c as f32) / scale))
+                .collect();
+            let base = dir.path().join(datatype.to_spec());
+            let mut writer = SigmfWriter::create(&base, datatype).unwrap();
+            writer.write_samples(&exact).unwrap();
+            // 0.7 of a code above zero, and below: truncation gives 0, 0.
+            writer
+                .write_samples(&[Complex32::new(0.7 / scale, -0.7 / scale)])
+                .unwrap();
+            writer
+                .finalize(SigmfWriterMeta {
+                    sample_rate_hz: 1e6,
+                    hardware: None,
+                    description: None,
+                    recorder: None,
+                    captures: vec![],
+                    annotations: vec![],
+                })
+                .unwrap();
+            let decoded =
+                datatype.decode(&std::fs::read(base.with_extension("sigmf-data")).unwrap());
+            let (between, round_trip) = decoded.split_last().unwrap();
+            for (got, want) in round_trip.iter().zip(&exact) {
+                assert_eq!(got.re, want.re, "{datatype:?}");
+                // -(-full scale) saturates to the largest positive code.
+                assert_eq!(got.im, want.im.min((scale - 1.0) / scale), "{datatype:?}");
+            }
+            assert_eq!(*between, Complex32::new(1.0 / scale, -1.0 / scale));
+        }
     }
 
     #[test]
@@ -617,6 +714,67 @@ mod tests {
         assert_eq!(meta.center_frequency_hz(), Some(2_435_000_000.0));
         assert_eq!(meta.data_type().unwrap(), DataType::Cf32Le);
         assert_eq!(meta.global.version, "1.0.0");
+    }
+
+    /// The earliest capture by `core:sample_start` names the recording's
+    /// frequency, whatever order the array lists them in; a tie goes to
+    /// the last listed, as in playback; and an earliest capture with no
+    /// frequency yields `None` rather than a later capture's.
+    #[test]
+    fn center_frequency_is_the_earliest_captures_not_the_first_listed() {
+        let meta = |captures: &str| -> SigmfMetadata {
+            serde_json::from_str(&format!(
+                r#"{{"global": {{"core:datatype": "cf32_le", "core:sample_rate": 1}},
+                    "captures": {captures}}}"#
+            ))
+            .unwrap()
+        };
+        let out_of_order = meta(
+            r#"[{"core:sample_start": 100, "core:frequency": 2.0},
+                {"core:sample_start": 0, "core:frequency": 1.0}]"#,
+        );
+        assert_eq!(out_of_order.center_frequency_hz(), Some(1.0));
+        let tie = meta(
+            r#"[{"core:sample_start": 0, "core:frequency": 5.0},
+                {"core:sample_start": 0, "core:frequency": 6.0}]"#,
+        );
+        assert_eq!(tie.center_frequency_hz(), Some(6.0));
+        let unstated = meta(
+            r#"[{"core:sample_start": 100, "core:frequency": 2.0},
+                {"core:sample_start": 0}]"#,
+        );
+        assert_eq!(unstated.center_frequency_hz(), None);
+    }
+
+    /// NaN has no integer code; `as` would have written it as 0 (and an
+    /// infinity as full scale), recording a sample nobody received.
+    #[test]
+    fn integer_writers_refuse_non_finite_samples_and_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        for datatype in [DataType::Ci8, DataType::Ci16Le] {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let base = dir.path().join(format!("{}_{bad}", datatype.to_spec()));
+                let mut writer = SigmfWriter::create(&base, datatype).unwrap();
+                let err = writer
+                    .write_samples(&[Complex32::new(0.5, 0.5), Complex32::new(0.1, bad)])
+                    .unwrap_err();
+                assert!(err.to_string().contains("sample 1"), "{err}");
+                drop(writer);
+                assert_eq!(
+                    std::fs::metadata(base.with_extension("sigmf-data"))
+                        .unwrap()
+                        .len(),
+                    0,
+                    "{datatype:?} {bad}: a refused call must write nothing"
+                );
+            }
+        }
+        // cf32 represents NaN, so it is written as given.
+        let base = dir.path().join("cf32");
+        let mut writer = SigmfWriter::create(&base, DataType::Cf32Le).unwrap();
+        writer
+            .write_samples(&[Complex32::new(f32::NAN, 0.0)])
+            .unwrap();
     }
 
     #[test]

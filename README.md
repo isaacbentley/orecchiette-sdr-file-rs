@@ -98,12 +98,24 @@ For each path, the source:
 3. Picks the datatype (`global.core:datatype`):
    - `cf32_le` → interleaved IEEE-754 f32, 8 bytes per IQ pair.
    - `ci16_le` → interleaved i16 LE, 4 bytes per IQ pair, scaled by `1/32768`.
-   - `ci8` → interleaved i8, 2 bytes per IQ pair, scaled by `1/127`.
+   - `ci8` → interleaved i8, 2 bytes per IQ pair, scaled by `1/128` (the same full scale as live HackRF
+     input, so -128 is exactly -1.0).
    - other datatypes are rejected; the source logs a warning and skips the file.
-4. Streams `.sigmf-data` and emits packets tagged with
-   `captures[].core:frequency` (uses the first capture; multi-capture
-   recordings are read end-to-end). Sample rate comes from
-   `global.core:sample_rate`.
+4. Streams `.sigmf-data` and emits packets tagged with each capture's
+   own `captures[].core:frequency`. Packets are cut at every capture's
+   `core:sample_start`, so no packet mixes two captures. A capture that
+   names no frequency (or samples before the first capture) is tagged
+   `UNKNOWN_CENTER_HZ` (0 Hz) and a warning is logged — never another
+   capture's frequency, which describes other samples, and the file is
+   still played, so a consumer that knows the frequency from elsewhere
+   (an operator's `--center-freq`) can supply it. Treat a non-positive
+   centre as unknown. A boundary the tags do not reveal — one that keeps
+   the frequency, or enters or leaves an unknown one — sets `overrun` on
+   the first packet after it, since SigMF starts a new capture exactly
+   when the recording is discontinuous. Sample rate comes from
+   `global.core:sample_rate`. `SigmfMetadata::center_frequency_hz()` is
+   the earliest capture's by `core:sample_start` (not the first listed),
+   or `None` if that capture names none.
 
 Only single-channel recordings are supported. Metadata with
 `core:num_channels` other than 1 is rejected; an omitted field means 1.
@@ -145,7 +157,10 @@ writer.finalize(SigmfWriterMeta {
 - `write_samples(&[Complex32])` encodes per the writer's `DataType`
   (`Cf32Le` uses a byte view on little-endian hosts and explicit encoding
   on big-endian hosts; `Ci16Le`/`Ci8` scale
-  from the unit disc, mirroring the reader's decode conventions).
+  from the unit disc, mirroring the reader's decode conventions). An
+  integer datatype has no code for NaN or infinity, so a non-finite sample
+  is an error and nothing from that call is written; `Cf32Le` writes it
+  as given.
 - `create()` preserves dots in recording basenames (`capture.001` becomes
   `capture.001.sigmf-data`), and accepts either SigMF suffix to identify the
   same pair. Creating the same recording again still truncates its data file.
@@ -179,7 +194,13 @@ Tests cover:
   sibling error path.
 - `looks_like_sigmf` recognises `.sigmf-meta` / `.sigmf-data` / bare
   base names and rejects unrelated extensions.
-- `SigmfWriter` round-trips through `cf32_le` and `ci8`, passes
+- multi-capture playback: per-capture frequency tags, packets cut at each
+  `core:sample_start`, same-frequency boundaries flagged as `overrun`, a
+  capture with no frequency tagged unknown rather than borrowing one, and
+  capture-list normalisation (unsorted, duplicate starts, leading gap).
+- `SigmfWriter` refuses non-finite samples for `ci16_le`/`ci8`, rounds
+  them to nearest, and every integer code
+  survives write → read; round-trips through `cf32_le` and `ci8`, passes
   pre-encoded bytes straight through via `write_raw`, and passes
   arbitrary `annotations` through verbatim.
 - End-to-end `sigmf_file_source_round_trip` writes a synthetic

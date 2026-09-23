@@ -30,7 +30,7 @@ graph TD
 SDR detection applications worker threads are optimized for batch processing. Both file backends:
 - Read raw bytes from disk in large 1 MB chunks for I/O efficiency.
 - Decode the specific data type (`i16`, `f32`) into `Complex32` samples.
-- Slice the decoded data into consistent 1,048,576-sample packets, each wrapped in a `PooledIqBuffer` for zero-allocation recycling.
+- Append each decoded sample once into a single accumulator, reserved up front for as much of the packet as the file can still supply, and hand the accumulator itself over (`mem::take`) as a 1,048,576-sample packet wrapped in a `PooledIqBuffer` for recycling. Packets are also cut at SigMF capture boundaries and at each file's end, so those packets are shorter.
 - Allocate sample storage on demand with an eight-packet queue (up to 64 MiB)
   and an eight-buffer recycler (up to another 64 MiB). Decoder working memory
   and packets retained by consumers are additional to these limits.
@@ -57,7 +57,11 @@ The [Signal Metadata Format (SigMF)](https://github.com/sigmf/sigmf-spec) provid
 3. **Parameter Extraction**:
    - `global.core:datatype` dictates the decoding path (`cf32_le`, `ci16_le`, or `ci8`).
    - `global.core:sample_rate` populates `IqPacket::sample_rate_hz`.
-   - `captures[0].core:frequency` populates `IqPacket::center_frequency_hz`.
+   - each capture's `core:frequency` populates `IqPacket::center_frequency_hz`
+     for the samples from its `core:sample_start` to the next capture's.
+     Samples no stated frequency covers are tagged `UNKNOWN_CENTER_HZ`
+     (0 Hz, not a frequency) rather than borrowing another capture's; the
+     file still plays, so a consumer with an out-of-band frequency can use it.
 
 By relying strictly on the metadata as the source of truth, `SigmfFileSource` safely overrides any contradictory CLI configuration, guaranteeing accurate playback scaling and frequency labels.
 
@@ -74,8 +78,8 @@ the source actually consults:
 | `global.core:sample_rate` | `IqPacket::sample_rate_hz`; must remain finite and positive as `f32` |
 | `global.core:num_channels` | Reject values other than 1; omission defaults to 1 |
 | `global.core:version` | parsed, not range-checked |
-| `captures[].core:frequency` | `IqPacket::center_frequency_hz` (first capture wins) |
-| `captures[].core:sample_start` | parsed (multi-capture support hook; not yet used to split packets) |
+| `captures[].core:frequency` | `IqPacket::center_frequency_hz` for that capture's samples; a capture without one is tagged `UNKNOWN_CENTER_HZ` (0 Hz). `SigmfMetadata::center_frequency_hz()` reports the earliest capture's by `core:sample_start` |
+| `captures[].core:sample_start` | packets are cut here; a boundary the tags do not reveal (same frequency, or into or out of an unknown one) sets `IqPacket::overrun` on the next packet |
 | `captures[].core:datetime` | parsed, not consumed |
 
 ### 🛠️ Helpers
@@ -87,7 +91,8 @@ the source actually consults:
 | `SigmfMetadata::load(meta_path)` | Read + parse a `.sigmf-meta` JSON file. |
 | `DataType::from_spec(s)` | `cf32_le` / `ci16_le` / `ci8` → enum, anything else → error. |
 | `DataType::to_spec(self) -> &str` | Inverse of `from_spec`, for tagging `core:datatype` on write. |
-| `DataType::decode(bytes) -> Vec<Complex32>` | Pure decoder, allocation-per-call (1 MB chunks are decoded into 131 072-sample vectors). |
+| `DataType::decode(bytes) -> Vec<Complex32>` | Pure decoder, allocation-per-call. One loop per datatype, so the per-sample body carries no branch. |
+| `DataType::decode_into(bytes, &mut Vec)` | Same decode, appending; playback reuses one scratch vector across reads. |
 
 ### `SigmfWriter`
 
@@ -107,7 +112,7 @@ single implementation those binaries now share:
 - `write_samples(&[Complex32])` uses the `Complex32`-to-bytes cast only
   on little-endian hosts. Big-endian hosts encode explicitly into a 64 KiB
   scratch buffer. Both paths are tested for exact byte output.
-  `Ci16Le`/`Ci8` scale from the unit disc to match the reader's decode conventions exactly (inverse operations).
+  `Ci16Le`/`Ci8` scale from the unit disc by the reader's full scale (32768 / 128), rounding to nearest and saturating, so every integer code survives a write → read exactly. They refuse a non-finite sample (an error, nothing from that call written) rather than recording NaN as 0 or an infinity as full scale; `Cf32Le` writes it as given.
 - `finalize(SigmfWriterMeta)` first validates that sample rates are usable
   for playback and that frequencies and coordinates are finite. It preserves
   signed and fractional frequencies, flushes the data file, and writes the
