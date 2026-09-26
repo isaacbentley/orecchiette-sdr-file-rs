@@ -1,5 +1,10 @@
 # orecchiette-sdr-file-rs
 
+> **Moved to [Specola](https://github.com/isaacbentley/specola).** This repository now lives at
+> [`crates/sdr-file`](https://github.com/isaacbentley/specola/tree/main/crates/sdr-file) (package `sdr-file`), with its full
+> history; its tags there carry a prefix. Development continues there, and this repository is
+> no longer updated.
+
 [![CI](https://github.com/isaacbentley/orecchiette-sdr-file-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette-sdr-file-rs/actions/workflows/ci.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/orecchiette-sdr-file-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
